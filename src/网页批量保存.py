@@ -671,6 +671,10 @@ def main():
     parser.add_argument('--no-scroll', action='store_true')
     parser.add_argument('--headless', action='store_true', help='使用无界面 Chrome，首次登录建议使用图形界面')
     parser.add_argument('--profile', type=Path, help='独立 Chrome 数据目录；默认使用本工具的专用浏览器数据')
+    parser.add_argument('--collect-links', nargs='+', metavar='URL', help='收集目录或章节入口后的链接，不保存正文')
+    parser.add_argument('--link-report', type=Path, help='链接收集结果 JSON 的保存位置')
+    parser.add_argument('--link-pattern', default='', help='正文网址匹配正则，留空使用默认规则')
+    parser.add_argument('--max-pages', type=int, default=500, help='链接收集最多检查页面数，1–5000')
     parser.add_argument('--organize', type=Path, help='仅整理指定文件夹内的本地HTML/MHTML，不启动浏览器')
     parser.add_argument('--organized-output', type=Path, help='整理结果的父目录，默认放在源文件夹内的“整理结果”')
     parser.add_argument('--text-title', default='网页正文', help='合并TXT标题')
@@ -682,6 +686,17 @@ def main():
     parser.add_argument('--order-reference', type=Path, help='旧版提取校验.json，缺少目录网页时用于恢复原顺序')
     parser.add_argument('--ui-smoke-test', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.collect_links:
+        from 网页链接收集 import collect, BrowserLinkReader
+        stop = threading.Event()
+        result = collect(args.collect_links, BrowserLinkReader(Browser(args.profile, args.headless), stop),
+                         content_pattern=args.link_pattern, max_pages=args.max_pages, stop=stop)
+        report = json.dumps(result, ensure_ascii=False, indent=2)
+        if args.link_report:
+            args.link_report.parent.mkdir(parents=True, exist_ok=True)
+            args.link_report.write_text(report, encoding='utf-8')
+        print(report)
+        raise SystemExit(0 if result['complete'] else 1)
     if args.organize:
         from 本地正文整理 import organize
         try:

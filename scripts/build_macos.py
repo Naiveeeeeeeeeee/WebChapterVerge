@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -40,7 +41,7 @@ def main():
     call("ditto", app, staging / app.name)
     (staging / "Applications").symlink_to("/Applications", target_is_directory=True)
     install_text = (ROOT / "docs/安装说明.txt").read_text(encoding="utf-8")
-    install_text = install_text.replace("网页保存与整理 1.0.0", f"网页保存与整理 {version}")
+    install_text = re.sub(r"网页保存与整理 \d+\.\d+\.\d+", f"网页保存与整理 {version}", install_text)
     install_text = install_text.replace("universal2 架构（arm64 + x86_64）", {
         "universal2": "universal2 架构（arm64 + x86_64）",
         "arm64": "Apple Silicon 架构（arm64）",

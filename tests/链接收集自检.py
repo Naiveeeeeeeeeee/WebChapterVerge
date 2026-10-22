@@ -101,6 +101,55 @@ class LinkTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             collect(["https://example.test/"], self.fetch, max_pages=0)
 
+    def test_chapter_entry_follows_next_chapter_and_nested_pages(self):
+        pages = {
+            "/book/42/a0ef.html": [("/book/42/z9ef.html", "第19章"),
+                                    ("/book/42/a0ef_2.html", "【2】"),
+                                    ("/book/42/b1fe.html", "下一章")],
+            "/book/42/a0ef_2.html": [("/book/42/b1fe.html", "下一章")],
+            "/book/42/b1fe.html": [("/book/42/a0ef.html", "上一章"),
+                                    ("/book/42/c3ff.html", "下一章")],
+            "/book/42/c3ff.html": [("/book/42/c3ff.html", "下一章"),
+                                    ("/book/99/a.html", "下一章"),
+                                    ("https://other.test/book/42/d.html", "下一章")],
+        }
+        result = collect(["https://example.test/book/42/a0ef.html"],
+                         lambda u: {"url": u, "links": [{"url": a, "text": b}
+                                     for a, b in pages[urlsplit(u).path]]})
+        self.assertTrue(result["complete"])
+        self.assertTrue(result["follow_chapters"])
+        self.assertEqual([urlsplit(u).path for u in result["urls"]], list(pages))
+        self.assertEqual(result["checked_pages"], 4)
+
+    def test_unrecognized_entry_is_not_complete(self):
+        result = collect(["https://example.test/catalog"],
+                         lambda u: {"url": u, "links": [{"url": "/unknown/a", "text": "第一章"}]})
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["warnings"])
+
+    def test_directory_keeps_original_order_without_next_chapter_detour(self):
+        pages = {
+            "/catalog": [("/book/42/a.html", "第一章"), ("/book/42/extra.html", "同人"),
+                          ("/book/42/b.html", "第二章")],
+            "/book/42/a.html": [("/book/42/b.html", "下一章")],
+            "/book/42/extra.html": [],
+            "/book/42/b.html": [("/book/42/other.html", "下一章")],
+        }
+        result = collect(["https://example.test/catalog"],
+                         lambda u: {"url": u, "links": [{"url": a, "text": b}
+                                     for a, b in pages[urlsplit(u).path]]})
+        self.assertTrue(result["complete"])
+        self.assertFalse(result["follow_chapters"])
+        self.assertEqual([urlsplit(u).path for u in result["urls"]], list(pages)[1:])
+
+    def test_custom_pattern_follows_next_chapter_with_punctuation(self):
+        first, second = "https://example.test/text/a", "https://example.test/text/b"
+        result = collect([first], lambda u: {"url": u, "links":
+                         [{"url": second, "text": "\ue001 下一節 »"}] if u == first else []},
+                         content_pattern=r"/text/")
+        self.assertEqual(result["urls"], [first, second])
+        self.assertTrue(result["complete"])
+
 
 def browser_test():
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -108,6 +157,24 @@ def browser_test():
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path == '/slow.png':
+                import time
+                time.sleep(7)
+                self.send_response(204)
+                self.end_headers()
+                return
+            if self.path == '/book/42/async.html':
+                html = ('<html><meta charset="utf-8"><title>异步链接测试</title>'
+                        '<img src="/slow.png"><div id="links"></div><script>'
+                        'setTimeout(()=>{document.querySelector("#links").innerHTML = '
+                        '\'<a href="/book/42/next.html">下一章</a>\'},450);'
+                        '</script></html>').encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+                return
             links = FIXTURE.get(self.path)
             if links is None:
                 self.send_error(404)
@@ -134,6 +201,13 @@ def browser_test():
                 assert result["complete"], result
                 assert [urlsplit(u).path for u in result["urls"]] == EXPECTED, result
                 print("真实 Chrome 本地测试通过：2 个目录页、3 个章节、2 个续页，顺序及去重正确。")
+                import time
+                start = time.monotonic()
+                async_result = BrowserLinkReader(browser, threading.Event(), selector='#links a', delay=0.05)(
+                    f"http://127.0.0.1:{server.server_port}/book/42/async.html")
+                assert any(link['url'].endswith('/book/42/next.html') for link in async_result['links']), async_result
+                assert time.monotonic() - start < 6, '不应等待无关图片加载完成'
+                print("异步章节链接可识别，无须等待缓慢图片加载。")
             finally:
                 if browser.process:
                     browser.process.terminate()

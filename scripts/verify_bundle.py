@@ -46,7 +46,16 @@ def main():
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                body = '<html><meta charset="utf-8"><title>本地安装包测试</title><body>归档测试正文。</body></html>'.encode()
+                links = {
+                    '/book/42/a0ef.html': '<a href="/book/42/z9ff.html">第19章</a><a href="/book/42/a0ef_2.html">【2】</a><a href="/book/42/b1ff.html">下一章</a>',
+                    '/book/42/a0ef_2.html': '<a href="/book/42/b1ff.html">下一章</a>',
+                    '/book/42/b1ff.html': '<a href="/book/42/b1ff.html">下一章</a><a href="/book/99/c.html">下一章</a>',
+                }
+                if self.path not in links and self.path != '/test':
+                    self.send_error(404)
+                    return
+                body = ('<html><meta charset="utf-8"><title>本地安装包测试</title><body>归档测试正文。'
+                        + links.get(self.path, '') + '</body></html>').encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -64,6 +73,13 @@ def main():
             run("--urls", urls, "--output", root / "archives", "--headless",
                 "--profile", profile, "--wait", "0.1", "--interval", "0", "--no-scroll")
             assert len(list((root / "archives").glob("*.mhtml"))) == 1
+            base = f"http://127.0.0.1:{server.server_port}"
+            run("--collect-links", base + "/book/42/a0ef.html", "--link-report", root / "links.json",
+                "--headless", "--profile", profile)
+            links = json.loads((root / "links.json").read_text())
+            assert links["complete"] and links["checked_pages"] == 3
+            assert links["urls"] == [base + p for p in
+                                     ["/book/42/a0ef.html", "/book/42/a0ef_2.html", "/book/42/b1ff.html"]]
         finally:
             # Close only the temporary profile started by this test, through its own CDP endpoint.
             marker = profile / "DevToolsActivePort"
@@ -86,7 +102,7 @@ def main():
                     time.sleep(0.1)
             server.shutdown()
             server.server_close()
-        print("PASS: relocated app, GUI, offline TXT processing, and real Chrome MHTML capture.")
+        print("PASS: relocated app, GUI, offline TXT, Chrome MHTML capture, and chapter/pagination link traversal.")
 
 
 if __name__ == "__main__":
