@@ -1,0 +1,27 @@
+网页保存与整理 1.0.0 · 本地发行验证
+日期：2026-10-22
+
+通过：
+- 15 项本地 TXT 整理测试。
+- 8 项链接收集规则测试。
+- 真实 Chrome 本机目录/分页遍历测试。
+- 独立 App 搬移到另一个目录后的启动。
+- 打包版本的 TXT 提取、分页合并、指定提示清理和引号换行测试。
+- 打包版本通过 Chrome 保存本地 HTTP 网页为 MHTML。
+- 通过 LaunchServices 打开 .app，界面正确初始化；无需终端。
+- arm64 原生启动、x86_64 在 Rosetta 下启动。
+- 49 个实际 Mach-O 文件均包含 arm64 与 x86_64；arm64 最低系统声明为 11.0。
+- App 的完整临时签名校验（codesign --verify --deep --strict）。
+- DMG 完整性校验、只读挂载、Applications 链接及图标资源检查。
+- 安装包不包含个人 MHTML、浏览器目录、Cookie、历史记录、用户设置或运行日志。
+- 应用模块字节码不含开发者主目录的绝对路径。
+
+未验证或尚未完成：
+- Intel 实体 Mac、各个旧版 macOS 的实机测试。Rosetta 测试不等于 Intel 实机测试。
+- Apple Developer ID 签名及 Apple 公证。当前为临时签名，互联网下载后的首次启动可能受到 Gatekeeper 拦截。
+- 未代替作者上传 GitHub，也未选择项目的开源授权协议。
+
+最终 DMG：
+WebArchive-1.0.0-macOS-universal2.dmg
+22569226 字节
+SHA-256：cc544e9ba31b2bc21382ac72ead779b49957c19f58e4f579f05eda4c38043672

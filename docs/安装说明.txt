@@ -1,0 +1,19 @@
+网页保存与整理 1.0.0
+
+1. 打开 DMG，把“网页保存与整理.app”拖到 Applications（应用程序）。
+2. 从“应用程序”启动。可以将图标拖到 Dock 固定。
+3. 网页保存、链接收集需要自行安装 Google Chrome；本地 TXT 整理不需要 Chrome。
+4. 已内置 Python 与 Tcl/Tk，不必安装 Python，不必运行 command，不需要 API Key。
+
+当前为本地临时签名构建，尚未完成 Apple Developer ID 签名及公证。
+互联网下载后的首次启动可能被 macOS 拦截；这与是否使用 ZIP 无关。
+确认来源可信后，可按 Apple 官方说明在“系统设置 → 隐私与安全性”中处理：
+https://support.apple.com/zh-cn/102445
+不建议关闭系统全局安全检查。面向大众正式发布时，建议完成 Developer ID 签名和公证。
+
+默认网页输出：~/Documents/网页保存与整理/已保存网页
+浏览器登录数据、设置和日志：~/Library/Application Support/WebArchive
+程序文件与个人资料分开存放，移动或更新 App 不会自动删除个人资料。
+
+此 DMG 包含 universal2 架构（arm64 + x86_64）；Intel 实机兼容性需进一步验证。
+目标系统为 macOS 11 或更新版本；尚未在所有旧版系统逐一验证。
