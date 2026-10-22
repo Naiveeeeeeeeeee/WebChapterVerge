@@ -299,7 +299,7 @@ def clean_lines(raw):
 
 def organize(source, destination=None, *, title="网页正文", selector="自动",
              fix_breaks=True, original_order=True, merge_pages=True, clean_notices=True,
-             order_reference=None, progress=None, cancel=None):
+             order_reference=None, progress=None, cancel=None, write_order_cache=True, pure_text=False):
     """将本地页面整理到新的结果目录，返回统计和输出路径。不会打开浏览器。"""
     started = time.perf_counter()
     source = Path(source).expanduser().resolve()
@@ -462,7 +462,7 @@ def organize(source, destination=None, *, title="网页正文", selector="自动
     folder.mkdir(parents=True, exist_ok=False)
     title = title.strip() or "网页正文"
     parts = [title]
-    if missing or errors or skipped:
+    if (missing or errors or skipped) and not pure_text:
         parts.append("本文件只包含已保存并成功提取的正文；缺页或未识别文件详见整理报告.txt。")
     index = [title + " · 目录", "按本地原目录排序" if original_order else "按章号排序", ""]
     section = None
@@ -535,7 +535,7 @@ def organize(source, destination=None, *, title="网页正文", selector="自动
                    for c in chapter_warnings for w in c["warnings"]]
     (folder / "引号检查.txt").write_text(
         "\n\n".join(quote_notes) or "未发现角引号配对疑点。", encoding="utf-8-sig")
-    if original_order and original_urls:
+    if original_order and original_urls and write_order_cache:
         cache.write_text(json.dumps({"urls": original_urls, "source": order_source},
                                     ensure_ascii=False, indent=2), encoding="utf-8")
     emit(f"完成：{len(records)}个正文页面，减少{summary['removed_line_breaks']}处折行；缺失{len(missing)}个分页。")

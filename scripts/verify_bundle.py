@@ -35,13 +35,17 @@ def main():
         (pages / "b.html").write_text(
             '<base href="https://example.test/view/1_2.html"><h1>第一章</h1>'
             '<div id="nr1">续页正文。</div>', encoding="utf-8")
-        run("--organize", pages, "--organized-output", root / "out", "--text-title", "本地测试")
+        run("--full-report", "--organize", pages, "--organized-output", root / "out", "--text-title", "本地测试")
         report_file = next((root / "out").glob("*/提取校验.json"))
         report = json.loads(report_file.read_text())
         text = (report_file.parent / "正文合并.txt").read_text(encoding="utf-8-sig")
         assert report["content_files"] == 2 and report["missing_pages"] == 0
         assert report["removed_notice_count"] == 1 and "「第一句。」\n「第二句。」" in text
         assert "续页正文。" in text and "本章未完" not in text
+        run("--organize", pages, "--organized-output", root / "txt", "--text-title", "测试小说")
+        assert [p.name for p in (root / "txt").iterdir()] == ["测试小说.txt"]
+        plain_text = (root / "txt/测试小说.txt").read_text(encoding="utf-8-sig")
+        assert "续页正文。" in plain_text and "本章未完" not in plain_text
         run("--ui-smoke-test")
 
         class Handler(BaseHTTPRequestHandler):

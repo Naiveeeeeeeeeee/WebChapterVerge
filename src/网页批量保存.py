@@ -180,13 +180,43 @@ class CDP:
 
 
 class Browser:
-    def __init__(self, profile=None, headless=False):
+    def __init__(self, profile=None, headless=True):
         self.profile = Path(profile or browser_profile()).resolve()
         self.headless = headless
         self.port = None
         self.process = None
+        self.lock = threading.RLock()
 
-    def ensure(self):
+    def ensure(self, headless=None):
+        with self.lock:
+            return self._ensure(self.headless if headless is None else headless)
+
+    def shutdown(self):
+        """只退出本工具专用配置的浏览器，不新启动进程。"""
+        with self.lock:
+            marker = self.profile / 'DevToolsActivePort'
+            try:
+                lines = marker.read_text().splitlines()
+                with HTTP.open(f'http://127.0.0.1:{int(lines[0])}/json/version', timeout=1) as response:
+                    info = json.load(response)
+                if urlsplit(info['webSocketDebuggerUrl']).path != lines[1]:
+                    return
+                cdp = CDP(info['webSocketDebuggerUrl'])
+                try:
+                    cdp.call('Browser.close', timeout=3)
+                except (OSError, RuntimeError):
+                    pass
+                finally:
+                    cdp.close()
+                if self.process:
+                    try:
+                        self.process.wait(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        pass
+            except (OSError, ValueError, KeyError, IndexError):
+                pass
+
+    def _ensure(self, headless):
         self.profile.mkdir(parents=True, exist_ok=True)
         os.chmod(self.profile, 0o700)
         marker = self.profile / 'DevToolsActivePort'
@@ -198,8 +228,24 @@ class Browser:
                 with HTTP.open(f'http://127.0.0.1:{port}/json/version', timeout=1) as response:
                     info = json.load(response)
                 if urlsplit(info['webSocketDebuggerUrl']).path == lines[1]:
-                    self.port = port
-                    return info['webSocketDebuggerUrl']
+                    running_headless = 'HeadlessChrome' in info.get('User-Agent', '')
+                    if running_headless == headless:
+                        self.port = port
+                        return info['webSocketDebuggerUrl']
+                    # 仅切换本工具的专用配置，保留登录状态；不操作用户日常 Chrome。
+                    cdp = CDP(info['webSocketDebuggerUrl'])
+                    try:
+                        cdp.call('Browser.close', timeout=5)
+                    except (OSError, RuntimeError):
+                        pass
+                    finally:
+                        cdp.close()
+                    for _ in range(150):
+                        if not (self.profile / 'SingletonLock').is_symlink():
+                            break
+                        time.sleep(0.1)
+                    else:
+                        raise RuntimeError('专用浏览器仍在退出，请稍后重试')
             except (OSError, ValueError, KeyError, IndexError):
                 pass
         if not CHROME.exists():
@@ -208,7 +254,7 @@ class Browser:
         args = [str(CHROME), f'--user-data-dir={self.profile}', '--remote-debugging-port=0',
                 '--remote-debugging-address=127.0.0.1', '--no-first-run',
                 '--no-default-browser-check', '--disable-background-timer-throttling']
-        if self.headless:
+        if headless:
             args += ['--headless=new']
         args += ['about:blank']
         self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL,
@@ -255,7 +301,7 @@ class Saver:
         cdp = CDP(self.browser.ensure(), self.stop)
         target = None
         try:
-            target = cdp.call('Target.createTarget', {'url': 'about:blank'})['targetId']
+            target = cdp.call('Target.createTarget', {'url': 'about:blank', 'background': True})['targetId']
             session = cdp.call('Target.attachToTarget', {'targetId': target, 'flatten': True})['sessionId']
             def call(method, params=None, limit=15):
                 self.wait()
@@ -266,8 +312,9 @@ class Saver:
                     raise RuntimeError('网页脚本执行失败')
                 return result.get('result', {}).get('value')
             call('Page.enable')
+            # 在浏览器内部模拟页面活跃，维持懒加载；不会激活 macOS 窗口或抢键盘焦点。
+            call('Emulation.setFocusEmulationEnabled', {'enabled': True})
             call('Network.enable', {'maxTotalBufferSize': 1000000, 'maxResourceBufferSize': 100000})
-            call('Page.bringToFront')
             navigation = call('Page.navigate', {'url': url}, timeout)
             if navigation.get('errorText'):
                 raise RuntimeError('网页打开失败：' + navigation['errorText'])
@@ -305,7 +352,9 @@ class Saver:
                         break
                 evaluate('window.scrollTo(0,0)')
                 self.wait(max(0.5, wait))
-            details = evaluate('({title:document.title,url:location.href})') or {}
+            details = evaluate('''({title:document.title,url:location.href,
+                metadata:Object.fromEntries([...document.querySelectorAll('meta[name],meta[property]')]
+                    .map(m=>[m.getAttribute('property')||m.name,m.content]))})''') or {}
             if details.get('url', '').startswith(('chrome-error:', 'about:blank')):
                 raise RuntimeError('浏览器显示错误页，未保存')
             for event in reversed(cdp.events):
@@ -342,7 +391,9 @@ class Saver:
             except BaseException:
                 path.unlink(missing_ok=True)
                 raise
+            from 书籍任务 import infer_book_title
             return {'url': url, 'final_url': details.get('url', url), 'title': title,
+                    'book_title': infer_book_title(title, details.get('metadata')),
                     'file': path.name, 'bytes': path.stat().st_size, 'status': '成功',
                     'error': '', 'saved_at': datetime.now().astimezone().isoformat(timespec='seconds')}
         finally:
@@ -387,278 +438,8 @@ def read_text(path):
 
 
 def gui(smoke_test=False):
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
-    from tkinter.scrolledtext import ScrolledText
-
-    class App:
-        def __init__(self):
-            self.root = tk.Tk()
-            self.root.title('网页批量保存 · MHTML / TXT整理')
-            self.root.geometry('960x830')
-            self.root.minsize(800, 680)
-            self.browser = Browser()
-            self.stop, self.pause = threading.Event(), threading.Event()
-            self.messages = queue.Queue()
-            self.busy = False
-            self.failed = []
-            self.rows = []
-            self.destination = tk.StringVar(value=str(output_directory()))
-            self.delay = tk.StringVar(value='3')
-            self.interval = tk.StringVar(value='1')
-            self.timeout = tk.StringVar(value='45')
-            self.scroll = tk.BooleanVar(value=True)
-            self.status = tk.StringVar(value='粘贴网址，每行一个；准备好后开始保存。')
-            outer = ttk.Frame(self.root, padding=22)
-            outer.pack(fill='both', expand=True)
-            ttk.Label(outer, text='把网页，留在本地。', font=('PingFang SC', 26, 'bold')).pack(anchor='w')
-            ttk.Label(outer, text='使用本机 Chrome，逐页保存为单文件 MHTML。',
-                      foreground='#666666').pack(anchor='w', pady=(4, 18))
-            top = ttk.Frame(outer)
-            top.pack(fill='x')
-            ttk.Label(top, text='网址清单', font=('PingFang SC', 13, 'bold')).pack(side='left')
-            self.import_btn = ttk.Button(top, text='导入 TXT', command=self.import_urls)
-            self.import_btn.pack(side='right')
-            self.collect_btn = ttk.Button(top, text='自动收集目录 / 分页链接', command=self.collect_links)
-            self.collect_btn.pack(side='right', padx=8)
-            self.text = ScrolledText(outer, height=8, font=('Menlo', 12), wrap='none', undo=True)
-            self.text.pack(fill='both', expand=True, pady=(8, 12))
-            pathrow = ttk.Frame(outer)
-            pathrow.pack(fill='x', pady=4)
-            ttk.Label(pathrow, text='保存到').pack(side='left', padx=(0, 8))
-            self.pathentry = ttk.Entry(pathrow, textvariable=self.destination)
-            self.pathentry.pack(side='left', fill='x', expand=True)
-            self.choose_btn = ttk.Button(pathrow, text='选择目录', command=self.choose)
-            self.choose_btn.pack(side='left', padx=(8, 0))
-            ttk.Button(pathrow, text='打开目录', command=self.open_folder).pack(side='left', padx=(8, 0))
-            settings = ttk.Frame(outer)
-            settings.pack(fill='x', pady=(10, 8))
-            self.settings = []
-            for label, variable in [('加载后等待（秒）', self.delay), ('网页间隔（秒）', self.interval), ('加载超时（秒）', self.timeout)]:
-                ttk.Label(settings, text=label).pack(side='left')
-                entry = ttk.Entry(settings, width=5, textvariable=variable)
-                entry.pack(side='left', padx=(5, 14))
-                self.settings.append(entry)
-            self.scrollcheck = ttk.Checkbutton(outer, text='保存前自动滚动，尝试加载长页面与懒加载图片（最多 30 秒）', variable=self.scroll)
-            self.scrollcheck.pack(anchor='w', pady=(0, 8))
-            actions = ttk.Frame(outer)
-            actions.pack(fill='x', pady=8)
-            self.login_btn = ttk.Button(actions, text='① 打开浏览器 / 先登录', command=self.open_browser)
-            self.login_btn.pack(side='left')
-            self.start_btn = ttk.Button(actions, text='② 开始批量保存', command=self.start)
-            self.start_btn.pack(side='left', padx=8)
-            self.pause_btn = ttk.Button(actions, text='暂停', state='disabled', command=self.toggle_pause)
-            self.pause_btn.pack(side='left')
-            self.stop_btn = ttk.Button(actions, text='停止', state='disabled', command=self.cancel)
-            self.stop_btn.pack(side='left', padx=8)
-            self.retry_btn = ttk.Button(actions, text='重试失败项', state='disabled', command=lambda: self.start(True))
-            self.retry_btn.pack(side='right')
-            self.organize_btn = ttk.Button(outer, text='③ 整理已保存网页 → 合并 TXT',
-                                           command=self.organize_local)
-            self.organize_btn.pack(anchor='w', pady=(2, 6))
-            self.progress = ttk.Progressbar(outer, mode='determinate')
-            self.progress.pack(fill='x', pady=(8, 6))
-            ttk.Label(outer, textvariable=self.status, wraplength=860).pack(anchor='w')
-            self.log = ScrolledText(outer, height=8, state='disabled', font=('PingFang SC', 11), wrap='word')
-            self.log.pack(fill='both', expand=True, pady=(10, 8))
-            ttk.Label(outer, text='登录请使用工具打开的专用 Chrome；首次需重新登录，之后保留。停止会保留已保存文件。',
-                      foreground='#666666', wraplength=860).pack(anchor='w')
-            self.root.protocol('WM_DELETE_WINDOW', self.close)
-            self.root.after(100, self.poll)
-            if smoke_test:
-                self.root.after(1800, self.root.destroy)
-                print('主窗口已初始化，含链接收集及 TXT 整理入口。', flush=True)
-
-        def append(self, value):
-            self.log.configure(state='normal')
-            self.log.insert('end', value + '\n')
-            self.log.see('end')
-            self.log.configure(state='disabled')
-
-        def choose(self):
-            folder = filedialog.askdirectory(initialdir=self.destination.get())
-            if folder:
-                self.destination.set(folder)
-                try:
-                    remember_output(folder)
-                except OSError as exc:
-                    self.append('未能记住保存目录：' + str(exc))
-
-        def open_folder(self):
-            try:
-                folder = Path(self.destination.get()).expanduser().resolve()
-                folder.mkdir(parents=True, exist_ok=True)
-                subprocess.Popen(['open', str(folder)])
-            except OSError as exc:
-                messagebox.showerror('无法打开目录', str(exc))
-
-        def import_urls(self):
-            file = filedialog.askopenfilename(filetypes=[('网址清单', '*.txt'), ('所有文件', '*')])
-            if file:
-                try:
-                    self.text.insert('end', '\n' + read_text(file))
-                except (OSError, UnicodeError, ValueError) as exc:
-                    messagebox.showerror('无法导入', str(exc))
-
-        def controls(self, busy):
-            self.busy = busy
-            for widget in [self.import_btn, self.choose_btn, self.pathentry, self.start_btn,
-                           self.login_btn, self.scrollcheck, self.organize_btn, self.collect_btn, *self.settings]:
-                widget.configure(state='disabled' if busy else 'normal')
-            self.text.configure(state='disabled' if busy else 'normal')
-            self.pause_btn.configure(state='normal' if busy else 'disabled', text='暂停')
-            self.stop_btn.configure(state='normal' if busy else 'disabled')
-            self.retry_btn.configure(state='normal' if self.failed and not busy else 'disabled')
-
-        def organize_local(self):
-            from 本地正文整理 import show_dialog
-            show_dialog(self.root, self.destination.get())
-
-        def collect_links(self):
-            from 网页链接收集 import show_dialog
-
-            def apply_urls(urls):
-                self.text.delete('1.0', 'end')
-                self.text.insert('1.0', '\n'.join(urls))
-                self.status.set(f'已放入 {len(urls)} 个链接；可开始批量保存。')
-
-            show_dialog(self.root, self.browser, self.text.get('1.0', 'end').strip(),
-                        apply_urls, self.destination.get())
-
-        def open_browser(self):
-            urls, _ = parse_urls(self.text.get('1.0', 'end'))
-            self.controls(True)
-            self.pause_btn.configure(state='disabled')
-            self.stop_btn.configure(state='disabled')
-            def work():
-                try:
-                    cdp = CDP(self.browser.ensure())
-                    try:
-                        target = cdp.call('Target.createTarget', {'url': urls[0] if urls else 'about:blank'})['targetId']
-                        cdp.call('Target.activateTarget', {'targetId': target})
-                    finally:
-                        cdp.close()
-                    self.messages.put(('log', '专用 Chrome 已打开。可在其中登录所需网站，完成后回到这里开始保存。'))
-                except Exception as exc:
-                    self.messages.put(('log', '浏览器打开失败：' + str(exc)))
-                finally:
-                    self.messages.put(('browser_done', None))
-            threading.Thread(target=work, daemon=True).start()
-
-        def start(self, retry=False):
-            urls, invalid = parse_urls(self.text.get('1.0', 'end'))
-            if retry:
-                urls, invalid = list(self.failed), []
-            if invalid:
-                messagebox.showerror('请先修正网址', '\n'.join(invalid[:12]) + '\n\n每行仅填写一个 http/https 网址。')
-                return
-            if not urls:
-                messagebox.showinfo('请填写网址', '请粘贴网址，每行一个，或导入 TXT。')
-                return
-            try:
-                delay, interval, timeout = float(self.delay.get()), float(self.interval.get()), float(self.timeout.get())
-                if not (0 <= delay <= 120 and 0 <= interval <= 120 and 5 <= timeout <= 300):
-                    raise ValueError()
-                folder = Path(self.destination.get()).expanduser().resolve()
-                folder.mkdir(parents=True, exist_ok=True)
-                # 提前检测可写性，避免浏览完才发现没有目录权限。
-                probe = folder / ('.write-check-' + os.urandom(8).hex())
-                with probe.open('xb'):
-                    pass
-                probe.unlink()
-            except (ValueError, OSError):
-                messagebox.showerror('检查设置', '等待/间隔填写 0–120 秒，超时填写 5–300 秒，并选择可写的保存目录。')
-                return
-            scroll = self.scroll.get()
-            try:
-                remember_output(folder)
-            except OSError as exc:
-                self.append('未能记住保存目录：' + str(exc))
-            self.stop.clear()
-            self.pause.clear()
-            self.failed, self.rows = [], []
-            self.controls(True)
-            self.progress.configure(maximum=len(urls), value=0)
-            self.status.set(f'准备保存 {len(urls)} 个网页…')
-            self.append(f'开始新批次：{len(urls)} 个去重后的网址 → {folder}')
-            def work():
-                rows = []
-                run_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-                saver = Saver(self.browser, self.stop, self.pause, lambda x: self.messages.put(('log', x)))
-                try:
-                    for i, url in enumerate(urls, 1):
-                        saver.wait()
-                        self.messages.put(('status', f'{i} / {len(urls)}  正在保存：{url}'))
-                        try:
-                            row = saver.save_one(url, folder, delay, scroll, timeout)
-                            self.messages.put(('log', f'✓ {i}/{len(urls)}  {row["file"]}'))
-                        except Cancelled:
-                            raise
-                        except Exception as exc:
-                            row = {'url': url, 'status': '失败', 'error': str(exc)}
-                            self.messages.put(('log', f'✗ {i}/{len(urls)}  {url}\n    {exc}'))
-                        rows.append(row)
-                        # 每页刷新清单，意外关闭时仍可检查已完成结果。
-                        write_report(folder, rows, run_id)
-                        self.messages.put(('progress', i))
-                        if i < len(urls):
-                            saver.wait(interval)
-                except Cancelled:
-                    self.messages.put(('log', '已停止。已保存文件保留，未处理网址仍留在输入框。'))
-                except Exception as exc:
-                    self.messages.put(('log', '任务中断：' + str(exc)))
-                finally:
-                    self.messages.put(('done', (rows, len(urls))))
-            threading.Thread(target=work, daemon=True).start()
-
-        def toggle_pause(self):
-            if self.pause.is_set():
-                self.pause.clear()
-                self.pause_btn.configure(text='暂停')
-                self.append('继续保存。')
-            else:
-                self.pause.set()
-                self.pause_btn.configure(text='继续')
-                self.append('已请求暂停，将在当前浏览器操作完成后暂停；页面本身仍可加载。')
-
-        def cancel(self):
-            self.stop.set()
-            self.pause.clear()
-            self.stop_btn.configure(state='disabled')
-            self.pause_btn.configure(state='disabled')
-            self.status.set('正在停止…')
-
-        def poll(self):
-            try:
-                while True:
-                    kind, value = self.messages.get_nowait()
-                    if kind == 'log':
-                        self.append(value)
-                    elif kind == 'status':
-                        self.status.set(value)
-                    elif kind == 'progress':
-                        self.progress.configure(value=value)
-                    elif kind == 'browser_done':
-                        self.controls(False)
-                    elif kind == 'done':
-                        self.rows, total = value
-                        self.failed = [r['url'] for r in self.rows if r['status'] == '失败']
-                        success = sum(r['status'] == '成功' for r in self.rows)
-                        self.status.set(f'成功 {success} 个 · 失败 {len(self.failed)} 个 · 未处理 {total-len(self.rows)} 个')
-                        self.controls(False)
-            except queue.Empty:
-                pass
-            self.root.after(100, self.poll)
-
-        def close(self):
-            if self.busy:
-                self.cancel()
-                self.status.set('停止任务后关闭窗口…')
-                self.root.after(150, self.close)
-                return
-            self.root.destroy()
-
-    App().root.mainloop()
+    from 桌面界面 import run
+    run(smoke_test=smoke_test)
 
 
 def main():
@@ -669,7 +450,8 @@ def main():
     parser.add_argument('--interval', type=float, default=1, help='页面之间间隔秒数（0–120）')
     parser.add_argument('--timeout', type=float, default=45, help='网页加载超时秒数（5–300）')
     parser.add_argument('--no-scroll', action='store_true')
-    parser.add_argument('--headless', action='store_true', help='使用无界面 Chrome，首次登录建议使用图形界面')
+    parser.add_argument('--headless', action='store_true', default=True, help='默认后台运行 Chrome')
+    parser.add_argument('--visible-browser', dest='headless', action='store_false', help='显式使用可见 Chrome，默认不显示窗口')
     parser.add_argument('--profile', type=Path, help='独立 Chrome 数据目录；默认使用本工具的专用浏览器数据')
     parser.add_argument('--collect-links', nargs='+', metavar='URL', help='收集目录或章节入口后的链接，不保存正文')
     parser.add_argument('--link-report', type=Path, help='链接收集结果 JSON 的保存位置')
@@ -677,7 +459,8 @@ def main():
     parser.add_argument('--max-pages', type=int, default=500, help='链接收集最多检查页面数，1–5000')
     parser.add_argument('--organize', type=Path, help='仅整理指定文件夹内的本地HTML/MHTML，不启动浏览器')
     parser.add_argument('--organized-output', type=Path, help='整理结果的父目录，默认放在源文件夹内的“整理结果”')
-    parser.add_argument('--text-title', default='网页正文', help='合并TXT标题')
+    parser.add_argument('--text-title', default='', help='小说名称，留空从网页识别')
+    parser.add_argument('--full-report', action='store_true', help='开发检查：生成完整诊断目录，默认只导出书名 TXT')
     parser.add_argument('--content-selector', default='自动', help='正文区域：自动、#ID、.类名或标签')
     parser.add_argument('--keep-linebreaks', action='store_true', help='保留网页折行，不进行断行修复')
     parser.add_argument('--chapter-order', action='store_true', help='按章号排序；默认优先采用已保存的原目录顺序')
@@ -699,11 +482,13 @@ def main():
         raise SystemExit(0 if result['complete'] else 1)
     if args.organize:
         from 本地正文整理 import organize
+        from 书籍任务 import export_text, text_output_directory
         try:
-            result = organize(args.organize, args.organized_output, title=args.text_title,
-                              selector=args.content_selector, fix_breaks=not args.keep_linebreaks,
-                              original_order=not args.chapter_order, merge_pages=not args.no_merge_pages,
-                              clean_notices=not args.keep_page_notices, order_reference=args.order_reference)
+            operation = organize if args.full_report else export_text
+            result = operation(args.organize, args.organized_output or text_output_directory(), title=args.text_title,
+                               selector=args.content_selector, fix_breaks=not args.keep_linebreaks,
+                               original_order=not args.chapter_order, merge_pages=not args.no_merge_pages,
+                               clean_notices=not args.keep_page_notices, order_reference=args.order_reference)
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
         print(json.dumps(result, ensure_ascii=False, indent=2))

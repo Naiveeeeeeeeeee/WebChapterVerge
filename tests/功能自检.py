@@ -164,7 +164,7 @@ class Integration(unittest.TestCase):
         urls = self.temp / 'urls.txt'
         urls.write_text(self.url + '/page\n' + self.url + '/missing\n' + self.url + '/page\n')
         output = self.temp / 'batch'
-        result = subprocess.run([sys.executable, str(BASE / '网页批量保存.py'), '--urls', str(urls),
+        result = subprocess.run([sys.executable, str(BASE.parent / 'src/网页批量保存.py'), '--urls', str(urls),
                 '--output', str(output), '--profile', str(self.browser.profile), '--headless',
                 '--wait', '0.2', '--interval', '0', '--no-scroll'], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)

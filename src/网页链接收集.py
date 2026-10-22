@@ -67,6 +67,7 @@ def collect(seeds, fetch, *, content_pattern="", max_pages=500, stop=None, progr
     known, visited, order, discovered = set(seeds), set(), [], set()
     errors, checked_directories, warnings = [], [], []
     titles = {}
+    book_names = []
     cancelled = False
 
     def record(url, label=""):
@@ -118,6 +119,10 @@ def collect(seeds, fetch, *, content_pattern="", max_pages=500, stop=None, progr
             if urlsplit(canonical(data.get("url") or current)).netloc not in allowed_hosts:
                 raise ValueError("页面跳转到其他站点，未继续读取其链接")
             links = links_from(data, current)
+            from 书籍任务 import infer_book_title
+            book_name = infer_book_title(data.get('title', ''), data.get('metadata'))
+            if book_name:
+                book_names.append(book_name)
         except Exception as exc:
             if stop and stop.is_set():
                 cancelled = True
@@ -170,11 +175,13 @@ def collect(seeds, fetch, *, content_pattern="", max_pages=500, stop=None, progr
     if not order and not errors and not cancelled:
         warnings.append("未识别到章节链接，不能判定收集完成。请检查入口、登录状态或正文网址匹配规则。")
     complete = bool(order) and not errors and not pending and not cancelled
+    from collections import Counter
     return {
         "urls": ordered, "titles": titles, "directories": checked_directories,
         "checked_pages": len(visited), "errors": errors, "pending": pending,
         "cancelled": cancelled, "complete": complete, "all_links": all_links,
         "warnings": warnings, "follow_chapters": follow_chapters,
+        "book_title": Counter(book_names).most_common(1)[0][0] if book_names else '',
         "limit_reached": bool(pending and len(visited) >= max_pages),
         "scope": "章节入口从当前章沿明确的下一章链接前进；目录入口保持目录顺序。仅检查实际链接，不保证适用于任意网站",
     }
@@ -192,7 +199,7 @@ class BrowserLinkReader:
         cdp = CDP(self.browser.ensure(), self.stop)
         target = None
         try:
-            target = cdp.call("Target.createTarget", {"url": "about:blank"})["targetId"]
+            target = cdp.call("Target.createTarget", {"url": "about:blank", "background": True})["targetId"]
             session = cdp.call("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
 
             def call(method, params=None, timeout=15):
@@ -206,6 +213,7 @@ class BrowserLinkReader:
                 return result.get("result", {}).get("value")
 
             call("Page.enable")
+            call("Emulation.setFocusEmulationEnabled", {"enabled": True})
             call("Network.enable")
             navigation = call("Page.navigate", {"url": url})
             if navigation.get("errorText"):
@@ -231,6 +239,8 @@ class BrowserLinkReader:
                     /^(?:[【\[（(]?\d+[】\]）)]?|下[一]?[页頁章節节回]|上一[页頁]|next(?:\s+chapter)?|previous)$/i.test(a.textContent.trim()));
                 const anchors = [...new Set([...selected, ...paging])];
                 return {url:location.href,title:document.title,
+                    metadata:Object.fromEntries([...document.querySelectorAll('meta[name],meta[property]')]
+                        .map(m=>[m.getAttribute('property')||m.name,m.content])),
                     links:anchors.filter(a=>a.href).map(a=>({url:a.href,text:a.textContent.trim()}))};
             })()""".replace("SELECTOR", json.dumps(self.selector))
             # DOM 已可读时不必等待广告图片等所有资源加载完成；同时给异步链接留出稳定时间。
@@ -265,62 +275,116 @@ class BrowserLinkReader:
             cdp.close()
 
 
-def show_dialog(parent, browser, initial, apply_urls, destination):
+def show_dialog(parent, browser, initial, apply_urls, destination, on_result=None):
     import tkinter as tk
     from tkinter import ttk, messagebox
     from tkinter.scrolledtext import ScrolledText
     from 网页批量保存 import parse_urls
     window = tk.Toplevel(parent)
-    window.title("自动收集网页链接")
+    from 界面主题 import setup_theme
+    setup_theme(window)
+    window.title("收集章节链接")
     window.geometry("860x760")
     window.minsize(760, 700)
     window.transient(parent)
     window.grab_set()
     outer = ttk.Frame(window, padding=18)
     outer.pack(fill="both", expand=True)
-    ttk.Label(outer, text="输入目录或章节网址，自动收集后续链接。", font=("PingFang SC", 17, "bold")).pack(anchor="w")
-    seeds = ScrolledText(outer, height=3, wrap="word")
-    seeds.pack(fill="x", pady=8)
+    ttk.Label(outer, text="粘贴网址，然后点击“开始收集”", font=("PingFang SC", 17, "bold")).pack(anchor="w")
+    ttk.Label(outer, text="网页网址（粘贴到下方白色框内，每行一个）", font=("PingFang SC", 12, "bold")).pack(anchor="w", pady=(14, 5))
+    seeds = ScrolledText(outer, name="entry_urls", height=4, wrap="word", background="white",
+                         foreground="#172033", insertbackground="#172033", relief="solid", borderwidth=1,
+                         padx=10, pady=8, font=("PingFang SC", 12))
+    seeds.pack(fill="x", pady=(0, 8))
     seeds.insert("1.0", initial)
     pattern, selector = tk.StringVar(), tk.StringVar()
     maximum = tk.StringVar(value="500")
     all_var = tk.BooleanVar()
     controls = [seeds]
-    for label, variable in [("正文网址匹配（正则，可留空）", pattern),
-                            ("目录链接选择器（可留空）", selector),
-                            ("最多检查页面数", maximum)]:
-        row = ttk.Frame(outer)
+    settings = ttk.Frame(outer)
+    settings.pack(fill="x", pady=4)
+    ttk.Label(settings, text="最多检查页数").pack(side="left")
+    limit_entry = ttk.Entry(settings, name="maximum_pages", textvariable=maximum, width=8)
+    limit_entry.pack(side="left", padx=8)
+    controls.append(limit_entry)
+    advanced_var = tk.BooleanVar(value=False)
+    advanced = ttk.Frame(outer, name="advanced")
+    def toggle_advanced():
+        if advanced_var.get():
+            advanced.pack(fill="x", after=settings)
+        else:
+            advanced.pack_forget()
+    advanced_toggle = ttk.Checkbutton(settings, text="高级设置（一般不用改）", variable=advanced_var,
+                                      command=toggle_advanced)
+    advanced_toggle.pack(side="right")
+    controls.append(advanced_toggle)
+    for label, variable, name in [("正文链接匹配规则（正则）", pattern, "content_pattern"),
+                                 ("目录链接选择器（CSS）", selector, "link_selector")]:
+        row = ttk.Frame(advanced)
         row.pack(fill="x", pady=4)
         ttk.Label(row, text=label, width=29).pack(side="left")
-        entry = ttk.Entry(row, textvariable=variable)
+        entry = ttk.Entry(row, name=name, textvariable=variable)
         entry.pack(side="left", fill="x", expand=True)
         controls.append(entry)
-    toggle = ttk.Checkbutton(outer, text="只列出输入页面上的同站点链接，不跟进分页", variable=all_var)
+    toggle = ttk.Checkbutton(advanced, text="只列出当前页面的链接，不继续翻页", variable=all_var)
     toggle.pack(anchor="w", pady=6)
     controls.append(toggle)
-    ttk.Label(outer, text="章节入口：从当前章沿“下一章”继续；目录入口：按目录顺序。两种方式均检查章内数字分页。\n"
-              "支持 /book/书号/章节.html、/view/、/chapter/、/read/；其他格式可填写匹配规则。\n"
-              "需要登录时先在主窗口打开专用浏览器登录。收集后可编辑清单，再放入保存列表。",
+    ttk.Label(advanced, text="这里填写识别规则，不是网页网址；留空使用默认规则。", foreground="#666666").pack(anchor="w")
+    ttk.Label(outer, text="目录网址：按目录顺序收集。章节网址：从当前章沿“下一章”继续，并检查章内分页。\n"
+              "需要登录时，先在主窗口打开专用浏览器登录。",
               foreground="#666666", wraplength=800).pack(anchor="w")
     status = tk.StringVar(value="只收集链接；不保存正文，不调用 AI。")
     ttk.Label(outer, textvariable=status, wraplength=800).pack(anchor="w", pady=8)
-    output = ScrolledText(outer, height=12, wrap="none", undo=True)
+    ttk.Label(outer, text="收集结果（完成后可编辑）").pack(anchor="w", pady=(4, 5))
+    output = ScrolledText(outer, name="collected_urls", height=10, wrap="none", undo=True,
+                          background='#f7f9fd', foreground='#172338', relief='flat',
+                          highlightthickness=1, highlightbackground='#dce3ee', padx=10, pady=8)
     output.pack(fill="both", expand=True)
     actions = ttk.Frame(outer)
     actions.pack(fill="x", pady=10)
     stop, events = threading.Event(), queue.Queue()
     state = {"busy": False, "result": None, "closing": False}
+    timers = {}
+
+    def dispose():
+        for timer in timers.values():
+            window.after_cancel(timer)
+        window.destroy()
+        # 已关闭对话框的 Tk 变量在主线程释放，避免后台采集触发循环垃圾回收时访问 Tk。
+        import gc
+        parent.after_idle(gc.collect)
 
     def start():
+        # 用户可能把网址贴进高级规则栏。明确的普通 HTTP(S) 地址自动移回入口，避免当成正则过滤掉所有续章。
+        misplaced = pattern.get().strip()
+        if re.match(r"^https?://", misplaced, re.I) and not re.search(r"[\[\]{}\\^$*|()]", misplaced):
+            moved, bad = parse_urls(misplaced)
+            if moved and not bad:
+                existing = seeds.get("1.0", "end").strip()
+                seeds.delete("1.0", "end")
+                seeds.insert("1.0", "\n".join([existing, *moved]).strip())
+                pattern.set("")
         urls, invalid = parse_urls(seeds.get("1.0", "end"))
+        if not urls or invalid:
+            seeds.focus_set()
+            messagebox.showerror("请检查网页网址", "请在顶部白色的“网页网址”框粘贴目录或章节网址。" if not urls and not invalid
+                                 else "以下网址格式有误：\n" + "\n".join(invalid), parent=window)
+            return
         try:
             limit = int(maximum.get())
-            if invalid or not urls or not 1 <= limit <= 5000:
-                raise ValueError("请填写有效入口网址，检查上限为 1–5000 页")
-            re.compile(pattern.get() or DEFAULT_CONTENT_PATTERN)
-        except (ValueError, re.error) as exc:
-            messagebox.showerror("检查设置", str(exc), parent=window)
+            if not 1 <= limit <= 5000:
+                raise ValueError()
+        except ValueError:
+            limit_entry.focus_set()
+            messagebox.showerror("请检查页数上限", "“最多检查页数”须填写 1–5000 之间的整数。", parent=window)
             return
+        try:
+            re.compile(pattern.get() or DEFAULT_CONTENT_PATTERN)
+        except re.error as exc:
+            messagebox.showerror("请检查高级设置", "正文链接匹配规则不是有效的正则表达式：\n" + str(exc), parent=window)
+            return
+        seeds.delete("1.0", "end")
+        seeds.insert("1.0", "\n".join(urls))
         options = dict(content_pattern=pattern.get(), max_pages=limit, all_links=all_var.get())
         reader = BrowserLinkReader(browser, stop, selector.get().strip())
         stop.clear()
@@ -361,8 +425,10 @@ def show_dialog(parent, browser, initial, apply_urls, destination):
         except OSError as exc:
             messagebox.showerror("保存清单失败", str(exc), parent=window)
             return
+        if on_result:
+            on_result(state['result'] or {})
         apply_urls(urls)
-        window.destroy()
+        dispose()
 
     def close():
         if state["busy"]:
@@ -370,7 +436,7 @@ def show_dialog(parent, browser, initial, apply_urls, destination):
             stop.set()
             status.set("正在停止并关闭…")
         else:
-            window.destroy()
+            dispose()
 
     def details():
         result = state["result"]
@@ -397,7 +463,7 @@ def show_dialog(parent, browser, initial, apply_urls, destination):
             window.grab_set()
         dialog.protocol("WM_DELETE_WINDOW", dismiss)
 
-    start_button = ttk.Button(actions, text="开始收集", command=start)
+    start_button = ttk.Button(actions, text="开始收集", command=start, style='Primary.TButton')
     start_button.pack(side="left")
     stop_button = ttk.Button(actions, text="停止", command=stop.set, state="disabled")
     stop_button.pack(side="left", padx=8)
@@ -432,12 +498,13 @@ def show_dialog(parent, browser, initial, apply_urls, destination):
                 else:
                     status.set("收集失败：" + data)
                 if state["closing"]:
-                    window.destroy()
+                    dispose()
                     return
         except queue.Empty:
             pass
-        window.after(100, poll)
+        timers['poll'] = window.after(100, poll)
 
     window.protocol("WM_DELETE_WINDOW", close)
-    window.after(100, poll)
+    timers['focus'] = window.after(100, seeds.focus_set)
+    timers['poll'] = window.after(100, poll)
     return window

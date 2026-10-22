@@ -1,1 +1,1 @@
-9b7562e8eb8f1b15ac655d8c4ae41837f2ed319c6c264262346c87533f998945  WebArchive-1.0.1-macOS-universal2.dmg
+c214d852a17c26984d4abea872fa4da3a9bd30a604c5d71b69957f17a05e7bca  WebArchive-1.1.0-macOS-universal2.dmg

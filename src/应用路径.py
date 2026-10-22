@@ -27,7 +27,7 @@ def output_directory():
 
 
 def browser_profile():
-    if not FROZEN:
+    if not FROZEN and not os.environ.get('WEB_ARCHIVE_DATA_DIR'):
         return SOURCE / "浏览器数据"
     return Path(preferences().get("browser_profile") or DATA / "浏览器数据").expanduser()
 
